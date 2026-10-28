@@ -283,6 +283,7 @@ part of cleanup and its contents would otherwise be lost.")
     (define-key map "a" (cons "switch to last harness" #'agent-buffers-switch))
     (define-key map "w" (cons "new jj workspace + agent" #'agent-buffers-workspace-create))
     (define-key map "t" (cons "toggle harness window" #'agent-buffers-toggle))
+    (define-key map "n" (cons "new session here" #'agent-buffers-new))
     (define-key map "C" (cons "continue latest session" #'agent-buffers-continue))
     (define-key map "R" (cons "resume: session picker" #'agent-buffers-resume))
     (define-key map "s" (cons "select harness" #'agent-buffers-select))
@@ -437,13 +438,22 @@ primary checkout / main workspace)."
       (expand-file-name (project-root project))
     (expand-file-name default-directory)))
 
-(defun agent-buffers--buffer-name (directory harness)
-  "Buffer name for HARNESS in DIRECTORY."
-  (funcall agent-buffers-buffer-name-function directory harness))
+(defun agent-buffers--buffer-name (directory harness &optional instance)
+  "Buffer name for HARNESS in DIRECTORY.
+INSTANCE numbers extra sessions of the same pair (see `agent-buffers-new');
+instances above 1 get a <N> suffix."
+  (let ((name (funcall agent-buffers-buffer-name-function directory harness)))
+    (if (and instance (> instance 1))
+        (format "%s<%d>" name instance)
+      name)))
 
-(defun agent-buffers--key (root harness)
-  "Session table key for ROOT and HARNESS."
-  (cons root harness))
+(defun agent-buffers--key (root harness &optional instance)
+  "Session table key for ROOT, HARNESS and INSTANCE (default 1)."
+  (list root harness (or instance 1)))
+
+(defun agent-buffers--key-harness (key)
+  "Harness of session table KEY."
+  (cadr key))
 
 (defun agent-buffers--context-for (working-dir)
   "Return the context string for WORKING-DIR, or nil."
@@ -513,7 +523,8 @@ When ROOT is non-nil, restrict to sessions rooted there."
   (let (sessions)
     (maphash (lambda (key process)
                (when (or (null root) (equal (car key) root))
-                 (push (cons (cdr key) (process-buffer process)) sessions)))
+                 (push (cons (agent-buffers--key-harness key) (process-buffer process))
+                       sessions)))
              agent-buffers--processes)
     sessions))
 
@@ -725,15 +736,16 @@ preferentially displayed in its canonical spot."
             (kill-buffer-query-functions nil))
         (kill-buffer buffer)))))
 
-(defun agent-buffers--start (harness &optional continue resume working-dir)
+(defun agent-buffers--start (harness &optional continue resume working-dir instance)
   "Start (or toggle) a HARNESS session for the current project.
 CONTINUE and RESUME select the harness's respective flags; RESUME may
 be a session id string to resume that specific session.  WORKING-DIR
-overrides the project root as the session's directory."
+overrides the project root as the session's directory.  INSTANCE picks
+which of several sessions of this (directory, harness) pair to use."
   (agent-buffers--cleanup-dead)
   (let* ((working-dir (or working-dir (agent-buffers--working-directory)))
-         (buffer-name (agent-buffers--buffer-name working-dir harness))
-         (key (agent-buffers--key working-dir harness))
+         (buffer-name (agent-buffers--buffer-name working-dir harness instance))
+         (key (agent-buffers--key working-dir harness instance))
          (existing-buffer (get-buffer buffer-name))
          (existing-process (gethash key agent-buffers--processes)))
     (if (and existing-buffer (buffer-live-p existing-buffer) existing-process)
@@ -776,6 +788,23 @@ overrides the project root as the session's directory."
         (agent-buffers--display-in-side-window buffer)
         (message "Started %s in %s" harness
                  (file-name-nondirectory (directory-file-name working-dir)))))))
+
+(defun agent-buffers--free-instance (working-dir harness)
+  "Return the lowest instance number with no session for HARNESS in WORKING-DIR."
+  (agent-buffers--cleanup-dead)
+  (let ((n 1))
+    (while (or (gethash (agent-buffers--key working-dir harness n)
+                        agent-buffers--processes)
+               (get-buffer (agent-buffers--buffer-name working-dir harness n)))
+      (setq n (1+ n)))
+    n))
+
+(defun agent-buffers--has-past-sessions-p (harness directory)
+  "Return non-nil unless HARNESS is known to have no past sessions in DIRECTORY.
+Harnesses without a :sessions-function are assumed to have some."
+  (let ((fn (agent-buffers--harness-get harness :sessions-function)))
+    (or (not (and fn (fboundp fn)))
+        (funcall fn directory))))
 
 (defun agent-buffers--switch-to-harness (harness &optional working-dir)
   "Switch to HARNESS in WORKING-DIR, creating it when needed."
@@ -826,11 +855,28 @@ create it."
   "Open the default harness, continuing the latest session here.
 Uses the program's :continue-flag (claude: --continue, codex: resume
 --last), which reopens the most recent session for this directory without
-prompting.  With a prefix ARG, prompt for which harness to use."
+prompting.  When the harness has no past session here, start a fresh one
+instead (the CLI would just exit).  With a prefix ARG, prompt for which
+harness to use."
   (interactive "P")
-  (agent-buffers--start (if arg (agent-buffers--read-harness)
-                        agent-buffers-default-harness)
-                      t))
+  (let ((harness (if arg (agent-buffers--read-harness)
+                   agent-buffers-default-harness)))
+    (agent-buffers--start harness
+                        (agent-buffers--has-past-sessions-p
+                         harness (agent-buffers--working-directory)))))
+
+;;;###autoload
+(defun agent-buffers-new (&optional arg)
+  "Start a new session of the default harness in this worktree.
+Unlike `agent-buffers', this never reuses a running session: when the
+harness already runs here, the new one gets a buffer suffixed <N>.  With
+a prefix ARG, prompt for which harness to use."
+  (interactive "P")
+  (let ((harness (if arg (agent-buffers--read-harness)
+                   agent-buffers-default-harness))
+        (working-dir (agent-buffers--working-directory)))
+    (agent-buffers--start harness nil nil working-dir
+                        (agent-buffers--free-instance working-dir harness))))
 
 ;;;###autoload
 (defun agent-buffers-resume (&optional arg)
@@ -879,18 +925,18 @@ With a prefix ARG, prompt for which harness to stop."
   (interactive)
   (agent-buffers--cleanup-dead)
   (let (sessions)
-    (maphash (lambda (key _)
-               (push (cons (format "%s  [%s]" (abbreviate-file-name (car key)) (cdr key))
-                           key)
+    (maphash (lambda (key process)
+               (push (cons (format "%s  [%s]" (abbreviate-file-name (car key))
+                                   (buffer-name (process-buffer process)))
+                           (process-buffer process))
                      sessions))
              agent-buffers--processes)
     (if (null sessions)
         (message "No active harness sessions")
       (let* ((choice (agent-buffers--completing-read
                       "Switch to session: " (mapcar #'car sessions)))
-             (key (alist-get choice sessions nil nil #'string=))
-             (buffer-name (agent-buffers--buffer-name (car key) (cdr key))))
-        (if-let* ((buffer (get-buffer buffer-name)))
+             (buffer (alist-get choice sessions nil nil #'string=)))
+        (if (buffer-live-p buffer)
             (agent-buffers--display-in-side-window buffer)
           (user-error "Buffer for %s no longer exists" choice))))))
 
